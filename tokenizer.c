@@ -20,13 +20,23 @@ gcc -O2 -Wall -pedantic --std=c99 -o tokenizer tokenizer.c -lbz2 \
 #include <libxml/xmlreader.h>
 #include "khash.h"
 
+#define MM_HEADER "%%MatrixMarket matrix coordinate real general\n"
+
 typedef struct {
 	unsigned long id;
 	char* token;
+	/* Document occurence. */
 	unsigned long occurence;
 } TokenDesc;
 
+typedef struct {
+	unsigned long id;
+	unsigned long occurence;
+} TokDocDesc;
+
 KHASH_MAP_INIT_STR(Tokens, TokenDesc*)
+KHASH_MAP_INIT_INT64(TokDoc, TokDocDesc*)
+
 khash_t(Tokens)* tokens;
 
 long totalBytesRead = 0;
@@ -34,13 +44,13 @@ long amountTokens = 0;
 long documentID = 0;
 
 typedef struct {
-	const xmlChar* title;
-	const xmlChar* content;
+	xmlChar* title;
+	xmlChar* content;
 } Page;
 
 /* XML parsing functions */
 void processTitle(xmlTextReader* reader, Page* page) {
-	const xmlChar* nodeName;
+	xmlChar* nodeName;
 	int type;
 	while (xmlTextReaderRead(reader) == 1) {
 		type		= xmlTextReaderNodeType(reader);
@@ -51,16 +61,18 @@ void processTitle(xmlTextReader* reader, Page* page) {
 		}
 		/* End element? */
 		else if (type == 15) {
-			nodeName = xmlTextReaderConstName(reader);
+			nodeName = xmlTextReaderName(reader);
 			if (xmlStrcmp(nodeName, (const xmlChar*) "title") == 0) {
+				xmlFree(nodeName);
 				return;
 			}
+			xmlFree(nodeName);
 		}
 	}	
 }
 
 void processText(xmlTextReader* reader, Page* page) {
-	const xmlChar* nodeName;
+	xmlChar* nodeName;
 	int type;
 	while (xmlTextReaderRead(reader) == 1) {
 		type		= xmlTextReaderNodeType(reader);
@@ -71,20 +83,23 @@ void processText(xmlTextReader* reader, Page* page) {
 		}
 		/* End element? */
 		else if (type == 15) {
-			nodeName = xmlTextReaderConstName(reader);
+			nodeName = xmlTextReaderName(reader);
 			if (xmlStrcmp(nodeName, (const xmlChar*) "text") == 0) {
+				xmlFree(nodeName);
 				return;
 			}
+			
+			xmlFree(nodeName);
 		}
 	}	
 }
 
 void processRevision(xmlTextReader* reader, Page* page) {
-	const xmlChar* nodeName;
+	xmlChar* nodeName;
 	int type;
 	while (xmlTextReaderRead(reader) == 1) {
 		type		= xmlTextReaderNodeType(reader);
-		nodeName	= xmlTextReaderConstName(reader);
+		nodeName	= xmlTextReaderName(reader);
 		
 		/* Start of an element? */
 		if (type == 1) {
@@ -95,9 +110,12 @@ void processRevision(xmlTextReader* reader, Page* page) {
 		/* End element? */
 		else if (type == 15) {
 			if (xmlStrcmp(nodeName, (const xmlChar*) "revision") == 0) {
+				xmlFree(nodeName);
 				return;
 			}
 		}
+		
+		xmlFree(nodeName);
 	}
 }
 
@@ -348,20 +366,20 @@ void toLower(char* s) {
 }
 
 /* Token functions. */
-void token(char* start, char* end) {
-	/*char* t = NULL;*/
+void token(char* start, char* end, khash_t(TokDoc)* tokensPerDocument) {
 	char t[256];
-	khint_t bucket;
+	khiter_t bucket;
 	TokenDesc* desc;
 	int result;
 	int size = end - start;
+	TokDocDesc* tokDocDesc;
 	
 	/*t = malloc(size + 1);*/
 	memcpy(t, start, size);
 	t[size] = '\0';
 	toLower(t);
 	
-	/* Check whether we already visited this one or not. */
+	/* Check whether we already visited this one or not in the total corpus. */
 	bucket = kh_get(Tokens, tokens, t);
 	if (bucket == kh_end(tokens)) {
 		desc			= malloc(sizeof(TokenDesc));
@@ -376,10 +394,27 @@ void token(char* start, char* end) {
 		desc = kh_value(tokens, bucket);
 	}
 	
-	++(desc->occurence);
+	/* Generate statistics for BOW model */
+	bucket = kh_get(TokDoc, tokensPerDocument, desc->id);
+	if (bucket == kh_end(tokensPerDocument)) {
+		bucket		= kh_put(TokDoc, tokensPerDocument, desc->id, &result);
+		tokDocDesc	= malloc(sizeof(TokDocDesc));
+		tokDocDesc->id = desc->id;
+		tokDocDesc->occurence = 0;
+		kh_value(tokensPerDocument, bucket) = tokDocDesc;
+		
+		/* Update document frequency. */
+		++(desc->occurence);
+	}
+	else {
+		tokDocDesc = kh_value(tokensPerDocument, bucket);
+	}
+	
+	++tokDocDesc->occurence;
+	
 }
 
-void tokenize(char* buffer, char* end) {
+void tokenize(char* buffer, char* end, khash_t(TokDoc)* tokensPerDocument) {
 	char* start = buffer;
 	long size;
 	unsigned char c;
@@ -394,7 +429,7 @@ void tokenize(char* buffer, char* end) {
 		if (c <= 64 || (c >= 91 && c <= 94 ) || c == 96 || (c >= 123 && c <= 126)) {
 			size = buffer - start;
 			if (size > 1 && size < 16) {
-				token(start, buffer);
+				token(start, buffer, tokensPerDocument);
 			}
 			
 			start = buffer + 1;
@@ -402,20 +437,39 @@ void tokenize(char* buffer, char* end) {
 	}
 }
 
-void processCompletePage(Page* page) {
+int compare(const void* a, const void* b) {
+	const TokDocDesc* e1 = (TokDocDesc*) a;
+	const TokDocDesc* e2 = (TokDocDesc*) b;
+	if (e1->id > e2->id) return 1;
+	else if (e1->id < e2->id) return -1;
+	else return 0;
+}
+
+void processCompletePage(Page* page, FILE* docBow, FILE* docID) {
 	char* buffer;
 	char* end;
 	int size;
+	khash_t(TokDoc)* tokensPerDocument;
+	khiter_t bucket;
+	TokDocDesc* tokDocDescs;
+	TokDocDesc* desc;
+	int i;
+	int mapSize;
+	int result;
 	
 	if (page->title == NULL || page->content == NULL) {
 		/* Screw good practice */
 		goto free;
 	}
 	
+	tokensPerDocument = kh_init(TokDoc);
+	
 	++documentID;
-	if (documentID % 10000 == 0) {
-		printf( "Processing document id: %lu\n", documentID);
+	if (documentID % 1000 == 0) {
+		printf( "Processing document id: %lu, amount unique tokens: %lu, amount bytes processed: %lu\n", documentID, amountTokens, totalBytesRead);
 	}
+	
+	fprintf(docID, "%lu\t%s\n", documentID, page->title);
 	
 	/* Perform an in-place replace/deletion of markup. */
 	size		= strlen((char*) page->content);
@@ -435,9 +489,31 @@ void processCompletePage(Page* page) {
 	
 	/* There may still be any []s, but they get ignored. The leftovers are due
 	to borked markup. Tokenize the page. */
-	tokenize(buffer, end);
+	tokenize(buffer, end, tokensPerDocument);
 	
+	/* Write frequencies to doc. Make sure it is sorted. */
+	mapSize = kh_size(tokensPerDocument);
+	tokDocDescs = malloc(sizeof(TokDocDesc) * mapSize);
+	for (i = 0, bucket = kh_begin(tokensPerDocument); bucket != kh_end(tokensPerDocument); ++bucket) {
+		if (kh_exist(tokensPerDocument, bucket)) {
+			desc = kh_value(tokensPerDocument, bucket);
+			memcpy(&tokDocDescs[i], desc, sizeof(TokDocDesc));
+			kh_del(TokDoc, tokensPerDocument, bucket);
+			free(desc);
+			++i;
+		}
+	}
+	
+	result = heapsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
+	for (i = 0; i < mapSize; ++i) {
+		desc = &tokDocDescs[i];
+		fprintf(docBow, "%lu\t%lu\t%lu\n", documentID, desc->id, desc->occurence);
+	}
+	
+	free(tokDocDescs);
 	free(buffer);
+	kh_destroy(TokDoc, tokensPerDocument);
+	
 free:
 	if (page->title != NULL) {
 		xmlFree((xmlChar*) page->title);
@@ -449,8 +525,8 @@ free:
 
 }
 
-void processPage(xmlTextReader* reader) {
-	const xmlChar* nodeName;
+void processPage(xmlTextReader* reader, FILE* docBow, FILE* docID) {
+	xmlChar* nodeName;
 	int type;
 	char ignorePage = 0;
 	Page page;
@@ -459,7 +535,7 @@ void processPage(xmlTextReader* reader) {
 	
 	while (xmlTextReaderRead(reader) == 1) {
 		type		= xmlTextReaderNodeType(reader);
-		nodeName	= xmlTextReaderConstName(reader);
+		nodeName	= xmlTextReaderName(reader);
 		
 		/* Start of an element? */
 		if (type == 1) {
@@ -477,23 +553,29 @@ void processPage(xmlTextReader* reader) {
 		/* End element? */
 		else if (type == 15) {
 			if (xmlStrcmp(nodeName, (const xmlChar*) "page") == 0) {
-				processCompletePage(&page);
+				processCompletePage(&page, docBow, docID);
+				xmlFree(nodeName);
 				return;
 			}
 		}
+		
+		xmlFree(nodeName);
 	}
 }
 
-void processDocument(xmlTextReader* reader) {
-	const xmlChar* nodeName;
+void processDocument(xmlTextReader* reader, FILE* docBow, FILE* docID) {
+	xmlChar* nodeName;
 	
 	while (xmlTextReaderRead(reader) == 1) {
 		/* Start of an element? */
 		if (xmlTextReaderNodeType(reader) == 1) {
-			nodeName = xmlTextReaderConstName(reader);
+			
+			nodeName = xmlTextReaderName(reader);
 			if (nodeName != NULL && xmlStrcmp (nodeName, (const xmlChar*) "page") == 0) {
-				processPage(reader);
+				processPage(reader, docBow, docID);
 			}
+			
+			xmlFree(nodeName);
 		}
 	}
 }
@@ -517,12 +599,26 @@ int closeCallback(void* context) {
 	return 0;
 }
 
+int help() {
+	printf("Syntax: tokenizer [input] [bow output] [word ID output] [docID output]\n");
+	return 0;
+}
+
 int main(int argc, char** argv) {
-	FILE* test;
+	FILE* wiki;
+	FILE* docBow;
+	FILE* wordID;
+	FILE* docID;
+	
 	xmlTextReader* reader;
 	int bzError;
 	BZFILE* compressed;
-	int bucket;
+	khiter_t bucket;
+	
+	/* We need input filename, output name for BOW per document and output filename for word IDs in total. */
+	if (argc != 5) {
+		return help();
+	}
 	
 	tokens = kh_init(Tokens);
 	if (tokens == NULL) {
@@ -530,13 +626,33 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 	
-	test = fopen("chunk-0200.xml.bz2", "r");
-	if (test == NULL) {
-		perror( "Cannot open file.\n");
+	wiki = fopen(argv[1], "r");
+	if (wiki == NULL) {
+		perror("Cannot open input file.\n");
 		return -1;
 	}
 	
-	compressed = BZ2_bzReadOpen(&bzError, test, 0, 0, NULL, 0);
+	docBow = fopen(argv[2], "w");
+	if (docBow == NULL) {
+		perror("Cannot create output file for BOW\n");
+		return -1;
+	}
+	
+	fwrite(MM_HEADER, sizeof(MM_HEADER), 1, docBow);
+	
+	wordID = fopen(argv[3], "w");
+	if (wordID == NULL) {
+		perror("Cannot create output file for word IDs\n");
+		return -1;
+	}
+	
+	docID = fopen(argv[4], "w");
+	if (wordID == NULL) {
+		perror("Cannot create output file for doc IDs\n");
+		return -1;
+	}
+	
+	compressed = BZ2_bzReadOpen(&bzError, wiki, 0, 0, NULL, 0);
 	if (compressed == NULL) {
 		perror("Cannot initialize BZIP2\n");
 		return -1;
@@ -548,19 +664,28 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 	
-	processDocument(reader);
+	processDocument(reader, docBow, docID);
+	fclose(docID);
+	fclose(docBow);
 	
 	printf( "Total uncompressed bytes read: %lu, processed documents: %lu, processed tokens: %lu\n", totalBytesRead, documentID, amountTokens);
 	
+	printf("Writing word IDs\n");
 	for (bucket = kh_begin(tokens); bucket != kh_end(tokens); ++bucket) {
 		if (kh_exist(tokens, bucket)) {
 			TokenDesc* desc = kh_value(tokens, bucket);
-			printf("Token: %s, ID: %lu, occurence: %lu\n", desc->token, desc->id, desc->occurence);
+			fprintf(wordID, "%lu\t%s\t%lu\n", desc->id, desc->token, desc->occurence);
+			
+			kh_del(Tokens, tokens, bucket);
+			free(desc->token);
+			free(desc);
 		}
 	}
 	
 	kh_destroy(Tokens, tokens);
 	
-	/* No cleanup because we are lazy. */
+	fclose(wordID);
+	
+	/* No further cleanup because we are lazy. */
 	return 0;
 }
