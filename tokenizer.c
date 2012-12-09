@@ -354,6 +354,7 @@ char* removeHTMLTags(char* source, char* end) {
 		}
 	}
 	
+	*destination++ = '\0';
 	return destination;
 }
 
@@ -473,10 +474,10 @@ void processCompletePage(Page* page, FILE* docBow, FILE* docID) {
 	
 	/* Perform an in-place replace/deletion of markup. */
 	size		= strlen((char*) page->content);
-	buffer		= malloc(size);
+	buffer		= malloc(size + 1);
 	end			= buffer + size;
 	
-	memcpy(buffer, page->content, size);
+	memcpy(buffer, page->content, size + 1);
 	
 	/* Remove any SGML comments, template notations ({{ and }}), [[ and ]]s, [ and ]s and
 	HTML tags. The first two are stripped altogether, the latter three are stripped but some
@@ -507,7 +508,7 @@ void processCompletePage(Page* page, FILE* docBow, FILE* docID) {
 	result = heapsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
 	for (i = 0; i < mapSize; ++i) {
 		desc = &tokDocDescs[i];
-		fprintf(docBow, "%lu\t%lu\t%lu\n", documentID, desc->id, desc->occurence);
+		fprintf(docBow, "%lu %lu %lu\n", documentID, desc->id, desc->occurence);
 	}
 	
 	free(tokDocDescs);
@@ -614,6 +615,7 @@ int main(int argc, char** argv) {
 	int bzError;
 	BZFILE* compressed;
 	khiter_t bucket;
+	char spaces[64];
 	
 	/* We need input filename, output name for BOW per document and output filename for word IDs in total. */
 	if (argc != 5) {
@@ -638,7 +640,10 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 	
+	memset(spaces, 32, sizeof(spaces));
+	spaces[sizeof(spaces) - 1] = '\n';
 	fwrite(MM_HEADER, sizeof(MM_HEADER), 1, docBow);
+	fwrite(spaces, sizeof(spaces), 1, docBow);
 	
 	wordID = fopen(argv[3], "w");
 	if (wordID == NULL) {
