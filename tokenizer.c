@@ -1,14 +1,14 @@
 /*
 Simple tokenizer for wikipedia dump
 - Uses bzip2 library for decompression on the fly
-- Uses libxml2 xml reader to parse the document. Specifically, it uses the xmlReader
-	API in order to make sure we use it from a streaming source.
+- Uses the expat xml reader to parse the document.
 - Uses klib/khash for hash maps.
+- Uses own simple buffer implementation to implement strings.
 - The rest is just "hacked" up together in order to make it work :-)
 
 Compiling on FreeBSD:
-gcc -O2 -Wall -pedantic --std=c99 -o tokenizer tokenizer.c -lbz2 \
-	-lxml2 -L/usr/local/lib/ -I/usr/local/include/libxml2/ -I/usr/local/include
+gcc -O2 -Wall -pedantic --std=c99 -o tokenizer tokenizer.c buffer.c -lbz2 \
+	-lexpat -L/usr/local/lib/ -I/usr/local/include
 
 */
 
@@ -17,8 +17,9 @@ gcc -O2 -Wall -pedantic --std=c99 -o tokenizer tokenizer.c -lbz2 \
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <libxml/xmlreader.h>
+#include <expat.h>
 #include "khash.h"
+#include "buffer.h"
 
 #define MM_HEADER "%%MatrixMarket matrix coordinate real general\n"
 
@@ -34,6 +35,20 @@ typedef struct {
 	unsigned long occurence;
 } TokDocDesc;
 
+#define STATE_IGNORE 0
+#define STATE_IN_TITLE 1
+#define STATE_IN_TEXT 2
+#define STATE_IN_PAGE 3
+
+struct ParsingState {
+	char state;
+	Buffer* title;
+	Buffer* text;
+	
+	FILE* docBow;
+	FILE* docID;
+};
+
 KHASH_MAP_INIT_STR(Tokens, TokenDesc*)
 KHASH_MAP_INIT_INT64(TokDoc, TokDocDesc*)
 
@@ -42,352 +57,44 @@ khash_t(Tokens)* tokens;
 long totalBytesRead = 0;
 long amountTokens = 0;
 long documentID = 0;
+long amountLines = 0;
 
-typedef struct {
-	xmlChar* title;
-	xmlChar* content;
-} Page;
-
-/* XML parsing functions */
-void processTitle(xmlTextReader* reader, Page* page) {
-	xmlChar* nodeName;
-	int type;
-	while (xmlTextReaderRead(reader) == 1) {
-		type		= xmlTextReaderNodeType(reader);
-		
-		/* Start of text? */
-		if (type == 3) {
-			page->title = xmlTextReaderValue(reader);
-		}
-		/* End element? */
-		else if (type == 15) {
-			nodeName = xmlTextReaderName(reader);
-			if (xmlStrcmp(nodeName, (const xmlChar*) "title") == 0) {
-				xmlFree(nodeName);
-				return;
-			}
-			xmlFree(nodeName);
-		}
-	}	
+/* Cleanup any left overs in order to make sure the title does not copied over to a new page. */
+static inline void resetState(struct ParsingState* state) {
+	bufferReset(state->title);
+	bufferReset(state->text);
+	state->state = STATE_IGNORE;
 }
 
-void processText(xmlTextReader* reader, Page* page) {
-	xmlChar* nodeName;
-	int type;
-	while (xmlTextReaderRead(reader) == 1) {
-		type		= xmlTextReaderNodeType(reader);
-		
-		/* Start of text? */
-		if (type == 3) {
-			page->content = xmlTextReaderValue(reader);
-		}
-		/* End element? */
-		else if (type == 15) {
-			nodeName = xmlTextReaderName(reader);
-			if (xmlStrcmp(nodeName, (const xmlChar*) "text") == 0) {
-				xmlFree(nodeName);
-				return;
-			}
-			
-			xmlFree(nodeName);
-		}
-	}	
-}
-
-void processRevision(xmlTextReader* reader, Page* page) {
-	xmlChar* nodeName;
-	int type;
-	while (xmlTextReaderRead(reader) == 1) {
-		type		= xmlTextReaderNodeType(reader);
-		nodeName	= xmlTextReaderName(reader);
-		
-		/* Start of an element? */
-		if (type == 1) {
-			if (xmlStrcmp(nodeName, (const xmlChar*) "text") == 0) {
-				processText(reader, page);
-			}
-		}
-		/* End element? */
-		else if (type == 15) {
-			if (xmlStrcmp(nodeName, (const xmlChar*) "revision") == 0) {
-				xmlFree(nodeName);
-				return;
-			}
-		}
-		
-		xmlFree(nodeName);
-	}
-}
-
-/* Markup deletion functions. */
-
-/*Loosely adapted from wikicorpus.py */
-char* removeTemplate(char* source, char* end) {
-	char* destination = source;
-	int open = 0;
-	
-	while (source < end) {
-		
-		if (open == 0) {
-			if (*source == '{' && (source + 1 < end) && *(source + 1) == '{') {
-				open += 2;
-				++source;
-			}
-			else {
-				*destination++ = *source;
-			}
-		}
-		else {
-			if (*source == '}') {
-				--open;
-			}
-			else if (*source == '{') {
-				++open;
-			}
-		}
-		
-		++source;
-	}
-	
-	*destination++ = '\0';
-	
-	return destination;
-}
-
-char* removeComments(char* source, char* end) {
-	char* destination = source;
-	char* found;
-	int bytesToCopy = 0;
-	
-	while (source < end) {
-		found = strstr(source, "<!--");
-		
-		if (found == NULL) {
-			if (destination == source) {
-				return end;
-			}
-			
-			bytesToCopy = end - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			break;
-		}
-		else {
-			bytesToCopy = found - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			
-			found = strstr(found + 4, "-->");
-			if (found == NULL) {
-				/* Unmatched, should not happen. */
-				break;
-			}
-			
-			source = found + 3;
-		}
-	}
-	
-	*destination++ = '\0';
-	return destination;
-}
-
-char* removeTags(char* source, char* end) {
-	char* destination = source;
-	char* start = NULL;
-	char open = 0;
-	char ignore = 0;
-	char metaText = 0;
-	char c;
-	int bytesToCopy = 0;
-	
-	while (source < end) {
-		
-		c = *source;
-		
-		if (!open) {
-			if (c == '[' && (source + 1 < end) && *(source + 1) == '[') {
-				open = 1;
-				source += 2;
-				start = source;
-			}
-			else {
-				*destination++ = *source++;
-			}
-		}
-		else {
-			if (c == '[' && (source + 1 < end) && *(source + 1) == '[') {
-				end = removeTags(source, end);
-			}
-			else if (c == ']' && (source + 1 < end) && *(source + 1) == ']') {
-				if (!ignore) {
-					bytesToCopy = source - start;
-					bcopy(start, destination, bytesToCopy);
-					destination += bytesToCopy;
-				}
-				
-				open		= 0;
-				source		+= 2;
-				
-				/* Cleanup any state from parsing [[]]s */
-				metaText	= 0;
-				ignore		= 0;
-			}
-			/* Don't ignore any meta text. This approach has the advantage that it selects only the right most meta text,
-			potentially ignoring any other meta data such as thumb. */ 
-			else if (c == '|') {
-				ignore = 0;
-				metaText = 1;
-				start = ++source;
-			}
-			/* Any [[foobar: is ignored. */
-			else if (c == ':' && !metaText) {
-				ignore = 1;
-				++source;
-			}
-			else {
-				++source;
-			}
-		}
-		
-	}
-	
-	*destination++ = '\0';
-	return destination;
-}
-
-/* Tries to remove any hyperlinks. Does not remove links in the format: http://example.com, i.e.
-it only removes [http://example.com] style links, while keeping any description of the link. */
-char* removeHyperlinks(char* source, char* end) {
-	char* destination = source;
-	char* found = NULL;
-	int bytesToCopy = 0;
-	char* metaText = NULL;
-	
-	while (source < end) {
-		found = strchr(source, '[');
-		if (found == NULL) {
-			if (destination == source) {
-				return end;
-			}
-			
-			bytesToCopy = end - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			break;
-		}
-		else {
-			bytesToCopy = found - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			source = found + 1;
-			
-			while (source < end) {
-				if (*source == ']') {
-					if (metaText != NULL) {
-						bytesToCopy = source - metaText;
-						bcopy(metaText, destination, bytesToCopy);
-						destination += bytesToCopy;
-						metaText = NULL;
-					}
-					++source;
-					break;
-				}
-				
-				if (metaText == NULL && *source == ' ') {
-					metaText = source + 1;
-				}
-				
-				++source;
-			}
-			
-		}
-		
-	}
-	
-	*destination++ = '\0';
-	return destination;	
-}
-
-/* Very simple HTML remover. */
-char* removeHTMLTags(char* source, char* end) {
-	char *destination = source;
-	char* found = NULL;
-	char ignoreMath = 0;
-	int bytesToCopy = 0;
-
-	while (source < end) {
-		found = strchr(source, '<');
-		if (found == NULL) {
-			if (destination == source) {
-				return end;
-			}
-			
-			bytesToCopy = end - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			break;
-		}
-		else {
-			bytesToCopy = found - source;
-			bcopy(source, destination, bytesToCopy);
-			destination += bytesToCopy;
-			source = found + 1;
-			
-			if (strncasecmp(source, "math", 4) == 0) {
-				ignoreMath = 1;
-			}
-			
-			found = strchr(source, '>');
-			if (found == NULL) {
-				break;
-			}
-			
-			source = found + 1;
-			if (ignoreMath) {
-				found = strstr(source, "</math>");
-				if (found == NULL) {
-					break;
-				}
-				
-				source = found + 8;
-			}
-		}
-	}
-	
-	*destination++ = '\0';
-	return destination;
-}
-
-
-void toLower(char* s) {
-	while (*s != '\0') {
-		*s = tolower(*s);
-		++s;		
-	}
-}
-
-/* Token functions. */
-void token(char* start, char* end, khash_t(TokDoc)* tokensPerDocument) {
-	char t[256];
+static inline void token(const char* begin, const char* end,  khash_t(TokDoc)* tokensPerDocument) {
+	unsigned int size = end - begin;
+	int i;
+	char* p;
+	char temp[49];
 	khiter_t bucket;
 	TokenDesc* desc;
-	int result;
-	int size = end - start;
 	TokDocDesc* tokDocDesc;
+	int result;
 	
-	/*t = malloc(size + 1);*/
-	memcpy(t, start, size);
-	t[size] = '\0';
-	toLower(t);
+	if (size < 2 || size > 48) {
+		return;
+	}
 	
-	/* Check whether we already visited this one or not in the total corpus. */
-	bucket = kh_get(Tokens, tokens, t);
+	memcpy(temp, begin, size);
+	temp[size] = 0;
+	
+	for (i = 0, p = temp; i < size; ++p, ++i) {
+		*p = tolower(*p);
+	}
+	
+	/* Make sure our word is registered in our global word list. */
+	bucket = kh_get(Tokens, tokens, temp);
 	if (bucket == kh_end(tokens)) {
 		desc			= malloc(sizeof(TokenDesc));
 		desc->id		= ++amountTokens;
 		desc->occurence = 0;
 		desc->token		= malloc(size + 1);
-		strcpy(desc->token, t);
+		strcpy(desc->token, temp);
 		bucket = kh_put(Tokens, tokens, desc->token, &result);
 		kh_value(tokens, bucket) = desc;
 	}
@@ -395,7 +102,7 @@ void token(char* start, char* end, khash_t(TokDoc)* tokensPerDocument) {
 		desc = kh_value(tokens, bucket);
 	}
 	
-	/* Generate statistics for BOW model */
+	/* Add the word, if necessary. to the per document word list. */ 
 	bucket = kh_get(TokDoc, tokensPerDocument, desc->id);
 	if (bucket == kh_end(tokensPerDocument)) {
 		bucket		= kh_put(TokDoc, tokensPerDocument, desc->id, &result);
@@ -412,30 +119,102 @@ void token(char* start, char* end, khash_t(TokDoc)* tokensPerDocument) {
 	}
 	
 	++tokDocDesc->occurence;
-	
 }
 
-void tokenize(char* buffer, char* end, khash_t(TokDoc)* tokensPerDocument) {
-	char* start = buffer;
-	long size;
-	unsigned char c;
+/* Skips, recursively, any template regardless of content. */
+const char* removeTemplate(const char* page, const char* pageEnd) {
+	char c;
+	char previous = 0;
 	
-	for (c = (unsigned char) *buffer; buffer < end; c = ((unsigned char) *++buffer)) {
-		/* Delimiters are any spaces, tabs, control characters, etc.
-		Specifically: 0 <= c <= 64 && 91 <= c <= 96 && 123 <= c <= 126
-		We assume any UTF-8 encoded character with code point > 128 is NOT a delimiter.
-		For an English wikipedia dump, this is most likely true.
-		It also ignores any single ASCII characters that are floating around.
-		*/
-		if (c <= 64 || (c >= 91 && c <= 94 ) || c == 96 || (c >= 123 && c <= 126)) {
-			size = buffer - start;
-			if (size > 1 && size < 16) {
-				token(start, buffer, tokensPerDocument);
+	while (page < pageEnd) {
+		c = *page++;
+		
+		if (previous == '{' && c == '{') {
+			page = removeTemplate(page + 1, pageEnd);
+		}
+		else if (previous == '}' && c == '}') {
+			return page + 1;
+		}
+		
+		previous = *(page - 1);
+	}
+	
+	return pageEnd;
+}
+
+/* Ignores anything between < .. >, even SGML-style comments. */
+const char* removeHTMLTags(const char* page, const char* pageEnd) {
+	char c;
+	unsigned int openings = 1;
+	
+	while (page < pageEnd) {
+		c = *page++;
+		
+		if (c == '<') {
+			++openings;
+		}
+		else if (c == '>') {
+			--openings;
+			if (openings == 0) {
+				break;
 			}
-			
-			start = buffer + 1;
 		}
 	}
+	
+	return page;
+}
+
+/*
+Technically, this function 'cheats'. It ignores everything until either a space or ] is encountered.
+Any subsequent ] is ignored either way.
+*/
+const char* removeAutoLinks(const char* page, const char* pageEnd) {
+	char c;
+	
+	for (c = *page; page < pageEnd; c = *(++page)) {
+		if (c == ' ' || c == ']') {
+			++page;
+			break;
+		}
+	}
+	
+	return page;
+}
+
+/*
+This function also cheats. It keeps track to where things should be ignored and any left over ]] is ignored by the main processing
+function.
+*/
+const char* removeTags(const char* page, const char* pageEnd) {
+	const char* begin = page;
+	char shouldIgnore = 0;
+	char metaText = 0;
+	char previous = 0;
+	char c;
+	
+	while (page < pageEnd) {
+		c = *page++;
+		
+		if (c == ']' && previous == ']') {
+			if (shouldIgnore) {
+				return page;
+			}
+			
+			return begin;
+		}
+		else if (c == '|') {
+			begin			= page;
+			shouldIgnore	= 0;
+			metaText		= 1;
+		}
+		else if (!metaText && c == ':') {
+			shouldIgnore	= 1;
+		}
+		
+		previous = c;
+	}
+	
+	return pageEnd;
 }
 
 int compare(const void* a, const void* b) {
@@ -446,55 +225,18 @@ int compare(const void* a, const void* b) {
 	else return 0;
 }
 
-void processCompletePage(Page* page, FILE* docBow, FILE* docID) {
-	char* buffer;
-	char* end;
-	int size;
-	khash_t(TokDoc)* tokensPerDocument;
-	khiter_t bucket;
+void writeFrequencies(struct ParsingState* parseState, khash_t(TokDoc)* tokensPerDocument) {
+	khint_t mapSize;
 	TokDocDesc* tokDocDescs;
 	TokDocDesc* desc;
-	int i;
-	int mapSize;
+	khiter_t bucket;
+	unsigned int i;
 	int result;
-	
-	if (page->title == NULL || page->content == NULL) {
-		/* Screw good practice */
-		goto free;
-	}
-	
-	tokensPerDocument = kh_init(TokDoc);
-	
-	++documentID;
-	if (documentID % 1000 == 0) {
-		printf( "Processing document id: %lu, amount unique tokens: %lu, amount bytes processed: %lu\n", documentID, amountTokens, totalBytesRead);
-	}
-	
-	fprintf(docID, "%lu\t%s\n", documentID, page->title);
-	
-	/* Perform an in-place replace/deletion of markup. */
-	size		= strlen((char*) page->content);
-	buffer		= malloc(size + 1);
-	end			= buffer + size;
-	
-	memcpy(buffer, page->content, size + 1);
-	
-	/* Remove any SGML comments, template notations ({{ and }}), [[ and ]]s, [ and ]s and
-	HTML tags. The first two are stripped altogether, the latter three are stripped but some
-	information may be retained, such as description. */
-	end = removeComments(buffer, end);
-	end = removeTemplate(buffer, end);
-	end = removeTags(buffer, end);
-	end = removeHyperlinks(buffer, end);
-	end = removeHTMLTags(buffer, end);
-	
-	/* There may still be any []s, but they get ignored. The leftovers are due
-	to borked markup. Tokenize the page. */
-	tokenize(buffer, end, tokensPerDocument);
-	
+
 	/* Write frequencies to doc. Make sure it is sorted. */
 	mapSize = kh_size(tokensPerDocument);
 	tokDocDescs = malloc(sizeof(TokDocDesc) * mapSize);
+	
 	for (i = 0, bucket = kh_begin(tokensPerDocument); bucket != kh_end(tokensPerDocument); ++bucket) {
 		if (kh_exist(tokensPerDocument, bucket)) {
 			desc = kh_value(tokensPerDocument, bucket);
@@ -508,96 +250,133 @@ void processCompletePage(Page* page, FILE* docBow, FILE* docID) {
 	result = heapsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
 	for (i = 0; i < mapSize; ++i) {
 		desc = &tokDocDescs[i];
-		fprintf(docBow, "%lu %lu %lu\n", documentID, desc->id, desc->occurence);
+		fprintf(parseState->docBow, "%lu %lu %lu\n", documentID, desc->id, desc->occurence);
 	}
 	
 	free(tokDocDescs);
-	free(buffer);
+}
+
+void processDocument(struct ParsingState* parseState) {
+	const char* page;
+	const char* pageEnd;
+	const char* beginWord;
+	char c;
+	char previous = 0;
+	khash_t(TokDoc)* tokensPerDocument;
+	
+	if (parseState->title->currentsize == 0 || parseState->text->currentsize == 0) {
+		return;
+	}
+	
+	tokensPerDocument	= kh_init(TokDoc);
+	page				= parseState->text->buffer;
+	pageEnd				= page + parseState->text->currentsize;
+	beginWord			= page;
+	
+	++documentID;
+	if (documentID % 1000 == 0) {
+		printf( "Processing document id: %lu, amount unique tokens: %lu, amount bytes processed: %lu\n", documentID, amountTokens, totalBytesRead);
+	}
+	
+	fprintf(parseState->docID, "%lu\t%.*s\n", documentID, parseState->title->currentsize, parseState->title->buffer);
+	
+	while (page < pageEnd) {
+		c = *page;
+		
+		/*
+		First check this character is a possible delimiter.
+		Delimiters are any spaces, tabs, control characters, etc.
+		Specifically: 0 <= c <= 64 && 91 <= c <= 96 && 123 <= c <= 126
+		We assume any UTF-8 encoded character with code point > 128 is NOT a delimiter.
+		For an English wikipedia dump, this is most likely true.
+		It also ignores any single ASCII characters that are floating around.
+		*/
+		if (!((c >= 0 && c <= 64) || (c >= 91 && c <= 94 ) || c == 96 || (c >= 123 && c <= 126))) {
+			++page;
+			previous = c;
+			continue;
+		}
+		
+		token(beginWord, page, tokensPerDocument);
+		++page;
+		
+		if (c == '{' && previous == '{') {
+			page = removeTemplate(page, pageEnd);
+			previous = 0;
+		}
+		else if (c == '<') {
+			page = removeHTMLTags(page, pageEnd);
+			previous = 0;
+		}
+		else if (previous == '[') {
+			if (c == '[') {
+				page = removeTags(page, pageEnd);
+			}
+			else {
+				page = removeAutoLinks(page, pageEnd);
+			}
+			previous = 0;
+		}
+		else {
+			previous = c;
+		}
+		
+		beginWord = page;
+	}
+	
+	/* Write frequencies already clears tokensPerDocument. */
+	amountLines += kh_size(tokensPerDocument);
+	writeFrequencies(parseState, tokensPerDocument);
 	kh_destroy(TokDoc, tokensPerDocument);
-	
-free:
-	if (page->title != NULL) {
-		xmlFree((xmlChar*) page->title);
-	}
-	
-	if (page->content != NULL) {
-		xmlFree((xmlChar*) page->content);
-	}
-
 }
 
-void processPage(xmlTextReader* reader, FILE* docBow, FILE* docID) {
-	xmlChar* nodeName;
-	int type;
-	char ignorePage = 0;
-	Page page;
+void beginElementHandler(void* data, const XML_Char* element, const XML_Char **atts) {
+	struct ParsingState *state = (struct ParsingState*) data;
 	
-	memset(&page, 0, sizeof(Page));
-	
-	while (xmlTextReaderRead(reader) == 1) {
-		type		= xmlTextReaderNodeType(reader);
-		nodeName	= xmlTextReaderName(reader);
-		
-		/* Start of an element? */
-		if (type == 1) {
-			if (xmlStrcmp(nodeName, (const xmlChar*) "title") == 0) {
-				processTitle(reader, &page);
-			}
-			else if (xmlStrcmp(nodeName, (const xmlChar*) "redirect") == 0) {
-				/* Ignore this page because a redirect was found. */
-				ignorePage = 1;
-			}
-			else if (!ignorePage && xmlStrcmp(nodeName, (const xmlChar*) "revision") == 0) {
-				processRevision(reader, &page);
-			}
+	if (state->state != STATE_IGNORE) {
+		if (strcmp(element, "title") == 0) {
+			bufferReset(state->title);
+			state->state = STATE_IN_TITLE;
 		}
-		/* End element? */
-		else if (type == 15) {
-			if (xmlStrcmp(nodeName, (const xmlChar*) "page") == 0) {
-				processCompletePage(&page, docBow, docID);
-				xmlFree(nodeName);
-				return;
-			}
+		else if (strcmp(element, "redirect") == 0) {
+			resetState(state);
 		}
-		
-		xmlFree(nodeName);
+		else if (strcmp(element, "text") == 0) {
+			bufferReset(state->text);
+			state->state = STATE_IN_TEXT;
+		}
+	}
+	else if (strcmp(element, "page") == 0) {
+		state->state = STATE_IN_PAGE;
 	}
 }
 
-void processDocument(xmlTextReader* reader, FILE* docBow, FILE* docID) {
-	xmlChar* nodeName;
+void endElementHandler(void *data, const char* element) {
+	struct ParsingState *state = (struct ParsingState*) data;
 	
-	while (xmlTextReaderRead(reader) == 1) {
-		/* Start of an element? */
-		if (xmlTextReaderNodeType(reader) == 1) {
-			
-			nodeName = xmlTextReaderName(reader);
-			if (nodeName != NULL && xmlStrcmp (nodeName, (const xmlChar*) "page") == 0) {
-				processPage(reader, docBow, docID);
-			}
-			
-			xmlFree(nodeName);
+	if (state->state != STATE_IGNORE) {
+		if (strcmp(element, "page") == 0) {
+			processDocument(state);
+			resetState(state);
+		}
+		else if (strcmp(element, "title") == 0 || strcmp(element, "text") == 0) {
+			state->state = STATE_IN_PAGE;
 		}
 	}
 }
 
-int inputCallback(void* context, char* buffer, int len) {
-	int bzError;
-	int bytesRead;
+void characterHandler(void* data, const XML_Char* buffer, int length) {
+	struct ParsingState* state = (struct ParsingState*) data;
 	
-	bytesRead = BZ2_bzRead(&bzError, (BZFILE*) context, buffer, len);
-	
-	if (bzError != BZ_OK && bzError != BZ_STREAM_END) {
-		return -1;
+	switch (state->state) {
+		case STATE_IN_TITLE:
+			bufferAdd(state->title, (char*) buffer, length);
+			break;
+		case STATE_IN_TEXT:
+			/* Copy text first before processing it, because the text may be ignored afterwards. */
+			bufferAdd(state->text, (char*) buffer, length);
+			break;
 	}
-	
-	totalBytesRead += bytesRead;
-	return bytesRead;
-}
-
-int closeCallback(void* context) {
-	/* Ignore this callback since the bzip2 file is closed in main() */
-	return 0;
 }
 
 int help() {
@@ -611,11 +390,15 @@ int main(int argc, char** argv) {
 	FILE* wordID;
 	FILE* docID;
 	
-	xmlTextReader* reader;
+	XML_Parser parser;
 	int bzError;
+	int bytesRead;
+	unsigned long i;
 	BZFILE* compressed;
 	khiter_t bucket;
 	char spaces[64];
+	char buffer[16384];
+	struct ParsingState state;
 	
 	/* We need input filename, output name for BOW per document and output filename for word IDs in total. */
 	if (argc != 5) {
@@ -663,20 +446,60 @@ int main(int argc, char** argv) {
 		return -1;
 	}
 	
-	reader = xmlReaderForIO(inputCallback, closeCallback, compressed, NULL, NULL, 0);
-	if (reader == NULL) {
-		perror("Cannot initialize LibXML");
+	parser = XML_ParserCreate("UTF-8");
+	if (parser == NULL) {
+		perror("Cannot initialize xml parser");
 		return -1;
 	}
 	
-	processDocument(reader, docBow, docID);
+	XML_SetUserData(parser, &state);
+	XML_SetElementHandler(parser, beginElementHandler, endElementHandler);
+	XML_SetCharacterDataHandler(parser, characterHandler);
+	
+	memset(&state, 0, sizeof(state));
+	state.title		= bufferInit();
+	state.text		= bufferInit();
+	state.docBow	= docBow;
+	state.docID		= docID;
+	
+	while (1) {
+		bytesRead = BZ2_bzRead(&bzError, compressed, buffer, sizeof(buffer));
+		
+		if (bzError != BZ_OK && bzError != BZ_STREAM_END) {
+			break;
+		}
+		
+		if (bytesRead == 0) {
+			break;
+		}
+		
+		totalBytesRead += bytesRead;
+		if (!XML_Parse(parser, buffer, bytesRead, bzError == BZ_STREAM_END)) {
+			perror("XML parsing error");
+			return -1;
+		}
+	}
+	
+	/* Cleanup any parsing data */
+	XML_ParserFree(parser);
+	BZ2_bzReadClose(&bzError, compressed);
+	bufferDestroy(state.title);
+	bufferDestroy(state.text);
+	fclose(wiki);
+	
 	fclose(docID);
+	
+	printf("Total uncompressed bytes read: %lu, processed documents: %lu, processed tokens: %lu\n",
+		totalBytesRead, documentID, amountTokens);
+	
+	fseek(docBow, sizeof(MM_HEADER) - 1, SEEK_SET);
+	fprintf(docBow, "%lu %lu %lu", documentID, amountTokens, amountLines);
 	fclose(docBow);
 	
-	printf( "Total uncompressed bytes read: %lu, processed documents: %lu, processed tokens: %lu\n", totalBytesRead, documentID, amountTokens);
+	setbuf(stdout, NULL);
+	printf("Writing word IDs: ");
 	
-	printf("Writing word IDs\n");
-	for (bucket = kh_begin(tokens); bucket != kh_end(tokens); ++bucket) {
+	for (i = 0, bucket = kh_begin(tokens); bucket != kh_end(tokens); ++bucket, ++i) {
 		if (kh_exist(tokens, bucket)) {
 			TokenDesc* desc = kh_value(tokens, bucket);
 			fprintf(wordID, "%lu\t%s\t%lu\n", desc->id, desc->token, desc->occurence);
@@ -684,13 +507,17 @@ int main(int argc, char** argv) {
 			kh_del(Tokens, tokens, bucket);
 			free(desc->token);
 			free(desc);
+			
+			if (i % 10000 == 0) {
+				putchar('.');
+			}
 		}
 	}
 	
+	printf("\n");
 	kh_destroy(Tokens, tokens);
 	
 	fclose(wordID);
 	
-	/* No further cleanup because we are lazy. */
 	return 0;
 }
