@@ -22,7 +22,7 @@ def notfound(start_response):
 print 'dictionary'
 dictionary = corpora.Dictionary.load_from_text('wordid.txt')
 print 'load corpus'
-corpus = corpora.MmCorpus('bow.mm')
+corpus = corpora.MmCorpus('tfidf.mm')
 print 'load lsi'
 lsi = models.LsiModel.load('irlsi.lsi')
 print 'load index'
