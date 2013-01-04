@@ -2,11 +2,12 @@ from urlparse import urlparse,urlsplit,parse_qs
 import re
 import uwsgi
 from gensim import corpora, models, similarities
+from html import index as htmlindex
 import simplejson
 import codecs
 
-COMMON_HEADERS = [('Content-Type', 'text/plain'), ('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Headers', 
-'Requested-With,Content-Type')]
+HTML_HEADERS = [('Content-Type', 'text/html'), ('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Headers','Requested-With,Content-Type')]
+COMMON_HEADERS = [('Content-Type', 'text/plain'), ('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Headers', 'Requested-With,Content-Type')]
 
 docids = {}
 f = codecs.open('docid.txt','r','UTF-8')
@@ -28,6 +29,12 @@ print 'load index'
 index = similarities.MatrixSimilarity.load('irlsi.index')
 
 def LSIclient(environ, start_response):
+    url = environ['PATH_INFO'][1:]
+    arguments = url.split('/')
+    if arguments[0] != 'api':
+        reply = htmlindex
+        start_response('200 OK', HTML_HEADERS + [('Content-length', str(len(reply)))])
+        return reply        
     params = parse_qs(environ.get('QUERY_STRING',''))
     if 'query' not in params:
     	    return notfound(start_response)
@@ -42,7 +49,7 @@ def LSIclient(environ, start_response):
         docid = doc[0]
         if doc[0] in docids:
             docid = docids[docid]
-        x = { docid : str(doc[1])}
+        x = ( docid , str(doc[1]))
         reply.append(x)
     reply = simplejson.dumps(reply)
     start_response('200 OK', COMMON_HEADERS + [('Content-length', str(len(reply)))])
