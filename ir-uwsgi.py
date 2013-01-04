@@ -39,8 +39,11 @@ def LSIclient(environ, start_response):
     sims = sorted(enumerate(sims), key=lambda item: -item[1])
     reply = []
     for doc in sims[:21]:
-        x = (docids[doc[0]],str(doc[1]))
-        reply.extend(x)
+        docid = doc[0]
+        if doc[0] in docids:
+            docid = docids[docid]
+        x = { docid : str(doc[1])}
+        reply.append(x)
     reply = simplejson.dumps(reply)
     start_response('200 OK', COMMON_HEADERS + [('Content-length', str(len(reply)))])
     return reply
