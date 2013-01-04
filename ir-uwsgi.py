@@ -12,7 +12,7 @@ docids = {}
 f = codecs.open('docid.txt','r','UTF-8')
 for line in f.read().split('\n')[:-1]:
     x = line.split('\t')
-    docids[x[0]] = x[1]
+    docids[int(x[0])] = x[1]
 
 def notfound(start_response):
     start_response('404 File Not Found', COMMON_HEADERS + [('Content-length', '2')])
@@ -39,7 +39,7 @@ def LSIclient(environ, start_response):
     sims = sorted(enumerate(sims), key=lambda item: -item[1])
     reply = []
     for doc in sims[:21]:
-        x = (docids[doc[0]],doc[1])
+        x = (docids[doc[0]],str(doc[1]))
         reply.extend(x)
     reply = simplejson.dumps(reply)
     start_response('200 OK', COMMON_HEADERS + [('Content-length', str(len(reply)))])
