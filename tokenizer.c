@@ -247,7 +247,7 @@ void writeFrequencies(struct ParsingState* parseState, khash_t(TokDoc)* tokensPe
 		}
 	}
 	
-	result = heapsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
+	result = qsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
 	for (i = 0; i < mapSize; ++i) {
 		desc = &tokDocDescs[i];
 		fprintf(parseState->docBow, "%lu %lu %lu\n", documentID, desc->id, desc->occurence);
