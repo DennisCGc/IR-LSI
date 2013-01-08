@@ -278,7 +278,7 @@ void processDocument(struct ParsingState* parseState) {
 		printf( "Processing document id: %lu, amount unique tokens: %lu, amount bytes processed: %lu\n", documentID, amountTokens, totalBytesRead);
 	}
 	
-	fprintf(parseState->docID, "%lu\t%.*s\n", documentID, parseState->title->currentsize, parseState->title->buffer);
+	fprintf(parseState->docID, "%lu\t%.*s\n", documentID, (int) (parseState->title->currentsize), parseState->title->buffer);
 	
 	while (page < pageEnd) {
 		c = *page;

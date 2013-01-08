@@ -13,7 +13,7 @@ docids = {}
 f = codecs.open('docid.txt','r','UTF-8')
 for line in f.read().split('\n')[:-1]:
     x = line.split('\t')
-    docids[int(x[0])] = x[1]
+    docids[int(x[0])-1] = x[1]
 
 def notfound(start_response):
     start_response('404 File Not Found', COMMON_HEADERS + [('Content-length', '2')])
@@ -40,8 +40,7 @@ def LSIclient(environ, start_response):
     	    return notfound(start_response)
     query = params['query'][0]
     print 'Querying %s' % query
-    vec_bow = dictionary.doc2bow(query.lower().split())
-    vec_lsi = lsi[vec_bow]
+    vec_lsi = lsi[corpus[dictionary.doc2bow(query.lower().split())]]
     sims = index[vec_lsi]
     sims = sorted(enumerate(sims), key=lambda item: -item[1])
     reply = []
