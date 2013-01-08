@@ -247,7 +247,7 @@ void writeFrequencies(struct ParsingState* parseState, khash_t(TokDoc)* tokensPe
 		}
 	}
 	
-	result = qsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
+	qsort(tokDocDescs, mapSize, sizeof(TokDocDesc), compare);
 	for (i = 0; i < mapSize; ++i) {
 		desc = &tokDocDescs[i];
 		fprintf(parseState->docBow, "%lu %lu %lu\n", documentID, desc->id, desc->occurence);
@@ -425,8 +425,15 @@ int main(int argc, char** argv) {
 	
 	memset(spaces, 32, sizeof(spaces));
 	spaces[sizeof(spaces) - 1] = '\n';
-	fwrite(MM_HEADER, sizeof(MM_HEADER), 1, docBow);
-	fwrite(spaces, sizeof(spaces), 1, docBow);
+	if (fwrite(MM_HEADER, sizeof(MM_HEADER), 1, docBow) == 0) {
+		perror("Cannot write.\n");
+		return -1;
+	}
+	
+	if (fwrite(spaces, sizeof(spaces), 1, docBow) == 0) {
+		perror("Cannot write.\n");
+		return -1;
+	}
 	
 	wordID = fopen(argv[3], "w");
 	if (wordID == NULL) {
