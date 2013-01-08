@@ -1,16 +1,16 @@
 import codecs
-from gensim import corpora, models, similarities
+from gensim import corpora, models, similarities, utils
+
+import logging
+logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
 print 'open corpora'
-corpus = corpora.MmCorpus('bow.mm')
-print 'open dictionary'
-dictionary = corpora.Dictionary.load_from_text('wordid.txt')
-print  'generate tfidf'
-tfidf = models.TfidfModel(corpus, id2word=dictionary, normalize=True)
-corpora.MmCorpus.serialize('tfidf.mm', tfidf[corpus], progress_cnt=10000)
 corpus = corpora.MmCorpus('tfidf.mm')
+print 'creating fake dictionary'
+fakedict = utils.FakeDict(corpus.num_terms)
 print 'generate lsi'
-lsi = models.LsiModel(corpus, id2word=dictionary, num_topics=100)
-index = similarities.MatrixSimilarity(lsi[corpus])
+lsi = models.LsiModel(corpus=corpus, id2word=fakedict, num_topics=150)
 lsi.save('irlsi.lsi')
+print 'generate index'
+index = similarities.Similarity(corpus=lsi[corpus], num_features = 150, output_prefix="shard")
 index.save('irlsi.index')
