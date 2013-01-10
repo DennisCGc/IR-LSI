@@ -231,7 +231,6 @@ void writeFrequencies(struct ParsingState* parseState, khash_t(TokDoc)* tokensPe
 	TokDocDesc* desc;
 	khiter_t bucket;
 	unsigned int i;
-	int result;
 
 	/* Write frequencies to doc. Make sure it is sorted. */
 	mapSize = kh_size(tokensPerDocument);
@@ -260,8 +259,8 @@ void processDocument(struct ParsingState* parseState) {
 	const char* page;
 	const char* pageEnd;
 	const char* beginWord;
-	char c;
-	char previous = 0;
+	unsigned char c;
+	unsigned char previous = 0;
 	khash_t(TokDoc)* tokensPerDocument;
 	
 	if (parseState->title->currentsize == 0 || parseState->text->currentsize == 0) {
@@ -281,7 +280,7 @@ void processDocument(struct ParsingState* parseState) {
 	fprintf(parseState->docID, "%lu\t%.*s\n", documentID, (int) (parseState->title->currentsize), parseState->title->buffer);
 	
 	while (page < pageEnd) {
-		c = *page;
+		c = (unsigned char) *page;
 		
 		/*
 		First check this character is a possible delimiter.
@@ -291,13 +290,24 @@ void processDocument(struct ParsingState* parseState) {
 		For an English wikipedia dump, this is most likely true.
 		It also ignores any single ASCII characters that are floating around.
 		*/
-		if (!((c >= 0 && c <= 64) || (c >= 91 && c <= 94 ) || c == 96 || (c >= 123 && c <= 126))) {
+		if (!(c <= 64 || (c >= 91 && c <= 96) || (c >= 123 && c <= 128) || (previous == 0xe2 && c == 0x80))) {
 			++page;
 			previous = c;
 			continue;
 		}
 		
-		token(beginWord, page, tokensPerDocument);
+		/* UTF-8 hack: possibly delimit on some utf-8 characters. */
+		if (previous == 0xe2 && c == 0x80) {
+			token(beginWord, page - 1, tokensPerDocument);
+			++page;
+			
+			/* Character makes no sense for further processing. */
+			c = 0;
+		}
+		else {
+			token(beginWord, page, tokensPerDocument);
+		}
+		
 		++page;
 		
 		if (c == '{' && previous == '{') {
