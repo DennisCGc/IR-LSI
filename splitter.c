@@ -2,10 +2,12 @@
 Simple dump. Dumps the first million pages.
 
 Compiling on FreeBSD:
-gcc -O2 -Wall -pedantic --std=c99 -o splitter splitter.c -lbz2
+gcc -O2 -Wall -pedantic --std=c99 -o splitter splitter.c -lbz2 \
+	-L/usr/local/lib/ -I/usr/local/include
 
 */
 
+#define _GNU_SOURCE
 #include <bzlib.h>
 #include <stdio.h>
 #include <stdlib.h>
